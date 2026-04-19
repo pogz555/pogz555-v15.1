@@ -1,16 +1,15 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 1. 모바일 최적화 기본 설정 ---
 st.set_page_config(page_title="퀀트 백테스트 v15.1", layout="wide", initial_sidebar_state="collapsed")
-st.title("📈 SOXL 듀얼모드 백테스트")
+st.title("📈 SOXL 듀얼모드 백테스트 (v15.1)")
 
-# --- 2. 입력 위젯 (모바일 친화적 상하 배치 및 1회 터치 탭) ---
+# --- 2. 입력 위젯 (모바일 친화적) ---
 st.markdown("### ⚙️ 기본 설정")
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -34,39 +33,66 @@ else:
     safe_buy = st.number_input("매수 (%) (안전)", value=5.0, step=0.1, format="%.1f")
     safe_sell = st.number_input("매도 (%) (안전)", value=5.0, step=0.1, format="%.1f")
 
-# --- 3. 데이터 수집 및 엔진 로직 (캐싱하여 속도 향상) ---
-@st.cache_data
+# --- 3. 데이터 엔진 (구글 시트 1:1 완벽 이식) ---
+@st.cache_data(show_spinner=False)
 def load_and_process_data(start, end):
-    df = yf.download("SOXL", start=start, end=end, interval="1wk")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
+    # 예열 기간을 포함하여 데이터 호출 (QQQ, SOXL)
+    warmup_start = "2017-01-01"
+    df_qqq = yf.download("QQQ", start=warmup_start, end=end + timedelta(days=7), interval="1d", auto_adjust=False)
+    df_soxl = yf.download("SOXL", start=warmup_start, end=end + timedelta(days=7), interval="1d", auto_adjust=False)
+    
+    if isinstance(df_qqq.columns, pd.MultiIndex):
+        df_qqq.columns = df_qqq.columns.droplevel(1)
+        df_soxl.columns = df_soxl.columns.droplevel(1)
         
-    df['RSI'] = df.ta.rsi(close='Close', length=14, mamode='rma')
-    df['RSI_1w_ago'] = df['RSI'].shift(1)
-    df['RSI_2w_ago'] = df['RSI'].shift(2)
+    df_qqq_fri = df_qqq.resample('W-FRI').last().dropna()
+    df_soxl_fri = df_soxl.resample('W-FRI').last().dropna()
+    
+    df = pd.DataFrame(index=df_qqq_fri.index)
+    df['QQQ_Close'] = df_qqq_fri['Close']
+    df['SOXL_Close'] = df_soxl_fri['Close']
+    
+    # RSI 연산 (구글 시트 D~I열 반올림 로직 완벽 복제)
+    N = 14
+    delta = df['QQQ_Close'].diff()
+    df['Gain'] = np.where(delta > 0, delta, 0)
+    df['Loss'] = np.where(delta < 0, -delta, 0)
+    
+    df['Gain'] = pd.Series(df['Gain'], index=df.index)
+    df['Loss'] = pd.Series(df['Loss'], index=df.index)
+    
+    df['Avg_Gain'] = df['Gain'].rolling(window=N).mean().round(4)
+    df['Avg_Loss'] = df['Loss'].rolling(window=N).mean().round(4)
+    
+    df['RS'] = np.where(df['Avg_Loss'] == 0, 0, (df['Avg_Gain'] / df['Avg_Loss'])).round(3)
+    df['RSI'] = np.where(df['Avg_Loss'] == 0, 100, np.round((df['RS'] / (1 + df['RS'])) * 100, 2))
+    
+    # 모드 판별 (K열 로직)
+    df['I33'] = df['RSI'].shift(1)
+    df['I32'] = df['RSI'].shift(2)
     
     def determine_mode(row):
-        curr, prev = row['RSI_1w_ago'], row['RSI_2w_ago']
-        if pd.isna(curr) or pd.isna(prev): return None
-        if (curr > 65 and curr < prev) or (40 < curr < 50 and curr < prev) or (prev >= 50 and curr < 50): return "안전"
-        if (prev <= 50 and curr > 50) or (50 < curr < 60 and curr > prev) or (curr < 35 and curr > prev): return "공세"
+        i33, i32 = row['I33'], row['I32']
+        if pd.isna(i33) or pd.isna(i32): return None
+        if (i32 > 65 and i32 > i33) or (40 < i32 < 50 and i32 > i33) or (i33 < 50 and 50 < i32): return "안전"
+        if (i32 < 35 and i32 < i33) or (50 < i32 < 60 and i32 < i33) or (i33 > 50 and 50 > i32): return "공세"
         return "유지"
 
     df['신호'] = df.apply(determine_mode, axis=1)
     df['최종_모드'] = df['신호'].replace('유지', np.nan).ffill()
     
-    # 임시 자산 데이터 생성 (향후 Slot 로직이 들어갈 자리)
-    # 현재는 차트 시각화를 위해 SOXL 수익률을 약간 변형한 가상 자산 흐름을 만듭니다.
-    df['Daily_Return'] = df['Close'].pct_change()
-    # 공세 모드일 때는 수익/손실 증폭, 안전 모드일 때는 축소 (가상 로직)
-    df['Strategy_Return'] = np.where(df['최종_모드'] == '공세', df['Daily_Return'] * 1.2, df['Daily_Return'] * 0.5)
-    df['Portfolio_Value'] = (1 + df['Strategy_Return'].fillna(0)).cumprod() * 10000 # 초기자본 1만불
+    # 사용자가 선택한 날짜 구간만 필터링
+    df = df.loc[pd.to_datetime(start):pd.to_datetime(end)].copy()
     
-    # MDD 계산
+    # [가상 자산 흐름] 시각화를 위한 임시 로직 (추후 Slot 연산으로 교체될 부분)
+    df['SOXL_Return'] = df['SOXL_Close'].pct_change()
+    df['Strategy_Return'] = np.where(df['최종_모드'] == '공세', df['SOXL_Return'] * 1.0, df['SOXL_Return'] * 0.3)
+    df['Portfolio_Value'] = (1 + df['Strategy_Return'].fillna(0)).cumprod() * 10000
+    
     rolling_max = df['Portfolio_Value'].cummax()
     df['Drawdown'] = (df['Portfolio_Value'] / rolling_max) - 1
     
-    return df.dropna(subset=['최종_모드'])
+    return df
 
 # 실행 버튼
 if st.button("🚀 백테스트 실행 (터치)", use_container_width=True):
@@ -75,10 +101,10 @@ if st.button("🚀 백테스트 실행 (터치)", use_container_width=True):
         
         # --- 4. 요약 지표 출력 ---
         st.divider()
-        st.markdown("### 📊 성과 요약")
+        st.markdown("### 📊 성과 요약 (가상 슬롯 적용 전)")
         
         total_return = (df['Portfolio_Value'].iloc[-1] / df['Portfolio_Value'].iloc[0]) - 1
-        days = (end_date - start_date).days
+        days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
         cagr = ((1 + total_return) ** (365.25 / days)) - 1 if days > 0 else 0
         max_mdd = df['Drawdown'].min()
         
@@ -87,34 +113,28 @@ if st.button("🚀 백테스트 실행 (터치)", use_container_width=True):
         m2.metric("CAGR", f"{cagr * 100:.2f}%")
         m3.metric("최대 낙폭 (MDD)", f"{max_mdd * 100:.2f}%")
         
-        # --- 5. 시각화 (이중 Y축, 로그 스케일, 배경색) ---
+        # --- 5. 시각화 ---
         fig = go.Figure()
         
-        # 기초 자산 (좌측 축)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='기초자산 (SOXL)', yaxis='y1', line=dict(color='gray', width=1.5)))
-        # 총 자산 (우측 축)
+        fig.add_trace(go.Scatter(x=df.index, y=df['SOXL_Close'], name='기초자산 (SOXL)', yaxis='y1', line=dict(color='gray', width=1.5)))
         fig.add_trace(go.Scatter(x=df.index, y=df['Portfolio_Value'], name='전략 총자산', yaxis='y2', line=dict(color='orange', width=2.5)))
         
-        # 배경색 칠하기 (공세=연홍색, 안전=연청색)
-        # 연속된 모드 구간을 찾아 사각형(vrect)으로 그림
         df['모드_변화'] = (df['최종_모드'] != df['최종_모드'].shift(1)).cumsum()
         for _, group in df.groupby('모드_변화'):
             mode = group['최종_모드'].iloc[0]
             color = "rgba(255, 99, 71, 0.1)" if mode == "공세" else "rgba(135, 206, 235, 0.1)"
             fig.add_vrect(x0=group.index[0], x1=group.index[-1], fillcolor=color, layer="below", line_width=0)
 
-        # 차트 레이아웃 설정 (로그 스케일 적용)
         fig.update_layout(
             title="총 자산 변동 추이 (Log Scale)",
             xaxis=dict(title="Date"),
-            yaxis=dict(title="기초자산 ($)", type="log", side="left", showgrid=False),
+            yaxis=dict(title="SOXL 가격 ($)", type="log", side="left", showgrid=False),
             yaxis2=dict(title="총자산 ($)", type="log", side="right", overlaying="y", showgrid=True),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5), # 모바일용 하단 범례
-            margin=dict(l=10, r=10, t=40, b=10) # 모바일 화면 꽉 차게 마진 최소화
+            legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+            margin=dict(l=10, r=10, t=40, b=10)
         )
         st.plotly_chart(fig, use_container_width=True)
         
-        # MDD 차트
         fig_mdd = go.Figure()
         fig_mdd.add_trace(go.Scatter(x=df.index, y=df['Drawdown'] * 100, fill='tozeroy', name='MDD', line=dict(color='red')))
         fig_mdd.update_layout(title="낙폭 (MDD, %)", yaxis=dict(title="%", range=[df['Drawdown'].min()*100*1.1, 0]), margin=dict(l=10, r=10, t=40, b=10))
