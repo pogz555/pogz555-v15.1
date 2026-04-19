@@ -24,14 +24,14 @@ mode_tab = st.radio("설정 모드 선택", ["🔴 공세 모드", "🔵 안전 
 
 if mode_tab == "🔴 공세 모드":
     st.info("현재 **공세 모드**의 변수를 설정 중입니다.")
-    agg_hold = st.number_input("최대보유일 (공세)", value=20, step=1)
-    agg_buy = st.number_input("매수 (%) (공세)", value=10.0, step=0.1, format="%.1f")
-    agg_sell = st.number_input("매도 (%) (공세)", value=15.0, step=0.1, format="%.1f")
+    agg_hold = st.number_input("최대보유일 (공세)", value=20, step=1, key="agg_hold_input")
+    agg_buy = st.number_input("매수 (%) (공세)", value=10.0, step=0.1, format="%.1f", key="agg_buy_input")
+    agg_sell = st.number_input("매도 (%) (공세)", value=15.0, step=0.1, format="%.1f", key="agg_sell_input")
 else:
     st.info("현재 **안전 모드**의 변수를 설정 중입니다.")
-    safe_hold = st.number_input("최대보유일 (안전)", value=10, step=1)
-    safe_buy = st.number_input("매수 (%) (안전)", value=5.0, step=0.1, format="%.1f")
-    safe_sell = st.number_input("매도 (%) (안전)", value=5.0, step=0.1, format="%.1f")
+    safe_hold = st.number_input("최대보유일 (안전)", value=10, step=1, key="safe_hold_input")
+    safe_buy = st.number_input("매수 (%) (안전)", value=5.0, step=0.1, format="%.1f", key="safe_buy_input")
+    safe_sell = st.number_input("매도 (%) (안전)", value=5.0, step=0.1, format="%.1f", key="safe_sell_input")
 
 # --- 3. 데이터 엔진 (구글 시트 1:1 완벽 이식) ---
 @st.cache_data(show_spinner=False)
